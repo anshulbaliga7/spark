@@ -1018,6 +1018,21 @@ abstract class SQLViewSuite extends QueryTest {
             s"`$SESSION_CATALOG_NAME`.`default`.`view2` -> " +
             s"`$SESSION_CATALOG_NAME`.`default`.`view1`"))
       )
+
+      // SPARK-58894: Detect cyclic view reference from a scalar subquery nested inside a
+      // larger expression (e.g. under an equality predicate). The previous shallow traversal
+      // only matched SubqueryExpression at the expression root and missed this case.
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql("ALTER VIEW view1 AS SELECT * FROM jt WHERE id = (SELECT id FROM view2 LIMIT 1)")
+        },
+        condition = "RECURSIVE_VIEW",
+        parameters = Map(
+          "viewIdent" -> s"`$SESSION_CATALOG_NAME`.`default`.`view1`",
+          "newPath" -> (s"`$SESSION_CATALOG_NAME`.`default`.`view1` -> " +
+            s"`$SESSION_CATALOG_NAME`.`default`.`view2` -> " +
+            s"`$SESSION_CATALOG_NAME`.`default`.`view1`"))
+      )
     }
   }
 
