@@ -19,6 +19,7 @@ package org.apache.spark.sql.catalyst.analysis
 
 import java.util.Locale
 
+import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions.{Alias, ArrayTransform, AttributeReference, Cast, CreateNamedStruct, GetStructField, If, IsNull, LessThanOrEqual, Literal}
@@ -26,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.objects.AssertNotNull
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
 import org.apache.spark.sql.types._
@@ -302,6 +304,63 @@ abstract class V2WriteAnalysisSuiteBase extends AnalysisTest {
   def byName(table: NamedRelation, query: LogicalPlan): LogicalPlan
 
   def byPosition(table: NamedRelation, query: LogicalPlan): LogicalPlan
+
+  // IBM-specific fix, internal issue #101664.
+  //
+  // Writing a CHAR/VARCHAR column into a plain string column produces an alignment alias whose
+  // `explicitMetadata` pin is empty, and `CleanupAliases` drops empty pins. From then on, only the
+  // fact that the alias child is a `Cast` keeps the query column's CHAR/VARCHAR raw type off the
+  // alias, and any rule that removes that no-op cast makes the write plan unresolved. The
+  // alignment alias must therefore declare the raw type key as non-inheritable.
+  //
+  // `SimplifyCasts` also refuses to remove such casts, but this test deliberately does not rely on
+  // that guard: it applies an unguarded copy of the rewrite, so it still fails if the
+  // `TableOutputResolver` fix alone is not sufficient.
+  test("IBM-101664: alignment alias must not inherit CHAR/VARCHAR metadata of the query column") {
+    object UnguardedNoopCastElimination extends Rule[LogicalPlan] {
+      override def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressions {
+        case Cast(e, dataType, _, _) if e.dataType == dataType => e
+      }
+    }
+
+    val rawTypeKey = CharVarcharUtils.CHAR_VARCHAR_TYPE_STRING_METADATA_KEY
+
+    for (
+      rawType <- Seq(CharType(3), VarcharType(64));
+      policy <- Seq(StoreAssignmentPolicy.ANSI, StoreAssignmentPolicy.STRICT);
+      write <- Seq[(NamedRelation, LogicalPlan) => LogicalPlan](byName, byPosition)
+    ) {
+      withSQLConf(SQLConf.STORE_ASSIGNMENT_POLICY.key -> policy.toString) {
+        // A JDBC-like source column: CHAR/VARCHAR raw type plus the metadata that
+        // `JdbcUtils.getSchema` attaches to every column.
+        val queryMetadata = new MetadataBuilder()
+          .putString(rawTypeKey, rawType.catalogString)
+          .putLong("scale", 0)
+          .build()
+        val query = TestRelation(Seq(
+          AttributeReference("x", FloatType)(),
+          AttributeReference("c", StringType, nullable = true, queryMetadata)()))
+        // A target column without metadata, e.g. an Iceberg table column.
+        val target = TestRelation(Seq($"x".float, AttributeReference("c", StringType)()))
+
+        val analyzed = getAnalyzer.executeAndCheck(write(target, query), new QueryPlanningTracker)
+        assertResolved(analyzed)
+
+        val aliases = analyzed.children.head.expressions.collect { case a: Alias => a }
+        assert(aliases.map(_.name) === Seq("c"))
+        assert(aliases.forall(_.nonInheritableMetadataKeys.contains(rawTypeKey)),
+          s"the alignment alias must not inherit $rawTypeKey:\n$analyzed")
+
+        val stripped = UnguardedNoopCastElimination(analyzed)
+        assert(!stripped.fastEquals(analyzed), s"the no-op cast was not removed:\n$analyzed")
+        assertResolved(stripped)
+        assert(
+          stripped.asInstanceOf[V2WriteCommand].query.output
+            .forall(a => CharVarcharUtils.getRawTypeString(a.metadata).isEmpty),
+          s"CHAR/VARCHAR metadata leaked onto the query output:\n$stripped")
+      }
+    }
+  }
 
   test("SPARK-49352: Avoid redundant array transform for identical expression") {
     def assertArrayField(fromType: ArrayType, toType: ArrayType, hasTransform: Boolean): Unit = {

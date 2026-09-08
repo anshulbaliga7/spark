@@ -38,6 +38,31 @@ import org.apache.spark.sql.types.{ArrayType, DataType, DecimalType, IntegralTyp
 
 object TableOutputResolver extends SQLConfHelper with Logging {
 
+  // IBM-specific fix, internal issue #101664.
+  //
+  // Alignment aliases must never inherit the CHAR/VARCHAR raw type of the query column, otherwise
+  // writing a CHAR/VARCHAR column into a plain string column can turn a resolved write plan into
+  // an unresolved one. CHAR(n)/VARCHAR(n) are represented as StringType plus the raw type in the
+  // attribute metadata, and `V2WriteCommand.areCompatible` compares
+  // `CharVarcharUtils.getRawType(queryAttr.metadata)` with the table column type.
+  //
+  // The aliases below do pin the table column metadata with `explicitMetadata`, but that pin only
+  // holds while the pinned metadata is non-empty: `CleanupAliases` (see
+  // `AliasHelper.trimNonTopLevelAliases`) drops explicit metadata that is empty, which is exactly
+  // the case for a table column without metadata. After that, the only thing keeping the query
+  // column metadata off the alias is that the alias child is a `Cast` rather than a
+  // `NamedExpression`, since `Alias.metadata` inherits from `NamedExpression` and
+  // `GetStructField` children. Any rule that removes that cast - `SimplifyCasts` did, and rules
+  // outside this repository such as optimizer extensions may too - resurfaces the CHAR/VARCHAR
+  // raw type and makes the write plan unresolved, which Spark 4.0's post-rule plan validation
+  // (SPARK-50256) reports as PLAN_VALIDATION_FAILED_RULE_IN_BATCH.
+  //
+  // Marking the key as non-inheritable states the invariant on the alias itself instead of relying
+  // on the shape of its child. `nonInheritableMetadataKeys` survives `CleanupAliases`, and
+  // `resolveArrayType` below already does this for the same reason.
+  private val charVarcharNonInheritableKeys =
+    Seq(CharVarcharUtils.CHAR_VARCHAR_TYPE_STRING_METADATA_KEY)
+
   def resolveVariableOutputColumns(
       expected: Seq[VariableReference],
       query: LogicalPlan,
@@ -181,7 +206,10 @@ object TableOutputResolver extends SQLConfHelper with Logging {
       } else {
         CharVarcharUtils.stringLengthCheck(casted, attr.dataType)
       }
-      Alias(exprWithStrLenCheck, attr.name)(explicitMetadata = Some(attr.metadata))
+      Alias(exprWithStrLenCheck, attr.name)(
+        explicitMetadata = Some(attr.metadata),
+        // IBM-specific fix, internal issue #101664. See `charVarcharNonInheritableKeys`.
+        nonInheritableMetadataKeys = charVarcharNonInheritableKeys)
     } else {
       value
     }
@@ -550,7 +578,10 @@ object TableOutputResolver extends SQLConfHelper with Logging {
     lazy val outputField = if (isCompatible(tableAttr, queryExpr)) {
       if (requiresNullChecks(queryExpr, tableAttr, conf)) {
         val assert = AssertNotNull(queryExpr, colPath)
-        Some(Alias(assert, tableAttr.name)(explicitMetadata = Some(tableAttr.metadata)))
+        Some(Alias(assert, tableAttr.name)(
+          explicitMetadata = Some(tableAttr.metadata),
+          // IBM-specific fix, internal issue #101664. See `charVarcharNonInheritableKeys`.
+          nonInheritableMetadataKeys = charVarcharNonInheritableKeys))
       } else {
         Some(queryExpr)
       }
@@ -566,7 +597,10 @@ object TableOutputResolver extends SQLConfHelper with Logging {
       // Renaming is needed for handling the following cases like
       // 1) Column names/types do not match, e.g., INSERT INTO TABLE tab1 SELECT 1, 2
       // 2) Target tables have column metadata
-      Some(Alias(exprWithStrLenCheck, tableAttr.name)(explicitMetadata = Some(tableAttr.metadata)))
+      Some(Alias(exprWithStrLenCheck, tableAttr.name)(
+        explicitMetadata = Some(tableAttr.metadata),
+        // IBM-specific fix, internal issue #101664. See `charVarcharNonInheritableKeys`.
+        nonInheritableMetadataKeys = charVarcharNonInheritableKeys))
     }
 
     val canWriteExpr = canWrite(
