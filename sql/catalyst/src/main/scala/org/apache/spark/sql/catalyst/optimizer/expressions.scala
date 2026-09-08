@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.catalyst.trees.{AlwaysProcess, TreeNodeTag}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -1100,7 +1101,7 @@ object FoldablePropagation extends Rule[LogicalPlan] {
 object SimplifyCasts extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
     _.containsPattern(CAST), ruleId) {
-    case Cast(e, dataType, _, _) if e.dataType == dataType => e
+    case Cast(e, dataType, _, _) if e.dataType == dataType && !hidesCharVarcharType(e) => e
     case c @ Cast(Cast(e, dt1: NumericType, _, _), dt2: NumericType, _, _)
         if isWiderCast(e.dataType, dt1) && isWiderCast(dt1, dt2) =>
       c.copy(child = e)
@@ -1118,6 +1119,33 @@ object SimplifyCasts extends Rule[LogicalPlan] {
   // any precision or range.
   private def isWiderCast(from: DataType, to: NumericType): Boolean =
     from.isInstanceOf[NumericType] && Cast.canUpCast(from, to)
+
+  // IBM-specific fix, internal issue #101664.
+  //
+  // A no-op `Cast` on top of a CHAR/VARCHAR column is not redundant: CHAR(n)/VARCHAR(n) columns
+  // are represented as StringType plus the raw type recorded in the attribute's metadata, and the
+  // cast is what hides that metadata from the parent `Alias`. `Alias.metadata` inherits the
+  // metadata of its child when the child is a `NamedExpression` or a `GetStructField` and no
+  // explicit metadata is set, and `CleanupAliases` drops explicit metadata that is empty (see
+  // `AliasHelper.trimNonTopLevelAliases`). So dropping such a cast resurfaces the CHAR/VARCHAR
+  // raw type on the output attribute.
+  //
+  // For DSv2 writes (e.g. DataFrameWriterV2.createOrReplace into Iceberg) this makes
+  // `V2WriteCommand.outputResolved` fail, because it compares
+  // `CharVarcharUtils.getRawType(queryAttr.metadata)` with the table column type: an already
+  // resolved write plan becomes unresolved and Spark 4.0's post-rule plan validation
+  // (SPARK-50256) fails the query with PLAN_VALIDATION_FAILED_RULE_IN_BATCH. Such no-op casts are
+  // inserted by `TableOutputResolver` whenever the query column type matches the table column type
+  // but the metadata differs, which is always the case for JDBC sources (JdbcUtils.getSchema
+  // attaches `isSigned`/`isTimestampNTZ`/`scale` metadata to every column).
+  //
+  // Keeping the cast is cheap (a same-type cast is a pass-through) and preserves the metadata
+  // handling the analyzer intended.
+  private def hidesCharVarcharType(e: Expression): Boolean = e match {
+    case named: NamedExpression => CharVarcharUtils.getRawTypeString(named.metadata).isDefined
+    case field: GetStructField => CharVarcharUtils.getRawTypeString(field.metadata).isDefined
+    case _ => false
+  }
 }
 
 

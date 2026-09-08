@@ -17,18 +17,41 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
+import org.apache.spark.sql.catalyst.QueryPlanningTracker
+import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, TestRelation}
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
+import org.apache.spark.sql.catalyst.expressions.{Alias, Cast}
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
 import org.apache.spark.sql.types._
 
-class SimplifyCastsSuite extends PlanTest {
+class SimplifyCastsSuite extends PlanTest with AnalysisTest {
 
   object Optimize extends RuleExecutor[LogicalPlan] {
     val batches = Batch("SimplifyCasts", FixedPoint(50), SimplifyCasts) :: Nil
+  }
+
+  // Same as `Optimize`, but with the plan validation that `Optimizer` runs after every effective
+  // rule, so that a plan that becomes unresolved fails with PLAN_VALIDATION_FAILED_RULE_IN_BATCH.
+  object OptimizeWithValidation extends RuleExecutor[LogicalPlan] {
+    val batches = Batch("SimplifyCasts", FixedPoint(50), SimplifyCasts) :: Nil
+
+    override protected def validatePlanChanges(
+        previousPlan: LogicalPlan,
+        currentPlan: LogicalPlan): Option[String] = {
+      LogicalPlanIntegrity.validateOptimizedPlan(previousPlan, currentPlan, lightweight = false)
+    }
+
+    override protected def validatePlanChangesLightweight(
+        previousPlan: LogicalPlan,
+        currentPlan: LogicalPlan): Option[String] = {
+      LogicalPlanIntegrity.validateOptimizedPlan(previousPlan, currentPlan, lightweight = true)
+    }
   }
 
   test("non-nullable element array to nullable element array cast") {
@@ -137,5 +160,76 @@ class SimplifyCastsSuite extends PlanTest {
       Optimize.execute(
         input.select($"a".cast(DecimalType(2, 1)).as("v")).analyze),
       input.select($"a".cast(DecimalType(2, 1)).as("v")).analyze)
+  }
+
+  // IBM-specific fix, internal issue #101664: a no-op cast on top of a CHAR/VARCHAR column hides
+  // the raw type metadata from the parent `Alias`. Removing it resurfaces the metadata on the
+  // query output attribute, which makes an already resolved DSv2 write command unresolved
+  // (`V2WriteCommand.outputResolved` compares the raw CHAR/VARCHAR type with the table column
+  // type) and makes Spark 4.0's post-rule plan validation (SPARK-50256) fail the query with
+  // PLAN_VALIDATION_FAILED_RULE_IN_BATCH.
+
+  // Mimics the metadata that `JdbcUtils.getSchema` attaches to every JDBC column. CHAR/VARCHAR
+  // columns additionally carry their raw type, see
+  // `CharVarcharUtils.replaceCharVarcharWithStringInSchema`.
+  private def jdbcMetadata(rawType: Option[DataType] = None): Metadata = {
+    val builder = new MetadataBuilder()
+      .putBoolean("isSigned", true)
+      .putBoolean("isTimestampNTZ", false)
+      .putLong("scale", 0)
+    rawType.foreach { dt =>
+      builder.putString(
+        CharVarcharUtils.CHAR_VARCHAR_TYPE_STRING_METADATA_KEY, dt.catalogString)
+    }
+    builder.build()
+  }
+
+  // A JDBC-sourced query written into a table whose columns carry no metadata (e.g. Iceberg).
+  // The CHAR/VARCHAR columns make `V2WriteCommand.outputResolved` false, so the analyzer adds an
+  // alignment projection; in it, every column gets a no-op cast because the types match but the
+  // metadata does not.
+  private def jdbcToTableWrite(fields: Seq[(String, DataType, Option[DataType])])
+    : Seq[LogicalPlan] = {
+    val source = TestRelation(StructType(fields.map { case (name, dt, rawType) =>
+      StructField(name, dt, nullable = true, jdbcMetadata(rawType))
+    }))
+    val target = TestRelation(StructType(fields.map { case (name, dt, _) =>
+      StructField(name, dt)
+    }))
+    Seq(AppendData.byName(target, source), AppendData.byPosition(target, source))
+  }
+
+  private def castedColumns(plan: LogicalPlan): Seq[String] = {
+    plan.collect { case p: Project =>
+      p.projectList.collect { case a: Alias if a.child.isInstanceOf[Cast] => a.name }
+    }.flatten
+  }
+
+  test("IBM-101664: keep no-op casts that hide CHAR/VARCHAR metadata in DSv2 writes") {
+    val fields = Seq(
+      ("id", LongType, None),
+      ("amt", DecimalType(38, 10), None),
+      ("ts", TimestampNTZType, None),
+      ("code", StringType, Some(CharType(3): DataType)),
+      ("name", StringType, Some(VarcharType(64): DataType)))
+    for (
+      policy <- Seq(StoreAssignmentPolicy.ANSI, StoreAssignmentPolicy.STRICT);
+      write <- jdbcToTableWrite(fields)
+    ) {
+      withSQLConf(SQLConf.STORE_ASSIGNMENT_POLICY.key -> policy.toString) {
+        val analyzed = getAnalyzer.executeAndCheck(write, new QueryPlanningTracker)
+        assert(analyzed.resolved, s"the test setup must produce a resolved plan:\n$analyzed")
+        assert(castedColumns(analyzed) === fields.map(_._1),
+          s"the test setup must produce an alignment cast per column:\n$analyzed")
+
+        // `OptimizeWithValidation` throws PLAN_VALIDATION_FAILED_RULE_IN_BATCH if the plan
+        // becomes unresolved, exactly like the production optimizer does.
+        val optimized = OptimizeWithValidation.execute(analyzed)
+        assert(optimized.resolved)
+        // Only the casts hiding CHAR/VARCHAR metadata are kept, the other no-op casts are still
+        // removed.
+        assert(castedColumns(optimized) === Seq("code", "name"))
+      }
+    }
   }
 }
