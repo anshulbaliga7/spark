@@ -17,16 +17,20 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
+import org.apache.spark.sql.catalyst.QueryPlanningTracker
+import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, TestRelation}
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.MetadataBuilder
+import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
+import org.apache.spark.sql.types.{CharType, MetadataBuilder, StringType, VarcharType}
 
-class RemoveRedundantAliasAndProjectSuite extends PlanTest {
+class RemoveRedundantAliasAndProjectSuite extends PlanTest with AnalysisTest {
 
   object Optimize extends RuleExecutor[LogicalPlan] {
     val batches = Batch(
@@ -236,6 +240,67 @@ class RemoveRedundantAliasAndProjectSuite extends PlanTest {
     withSQLConf(SQLConf.EXCLUDE_SUBQUERY_EXP_REFS_FROM_REMOVE_REDUNDANT_ALIASES.key -> "false") {
       val optimized = Optimize.execute(query)
       comparePlans(optimized, expectedWhenNotEnabled)
+    }
+  }
+
+  // IBM-specific fix, internal issue #101664.
+  //
+  // The alignment alias that `TableOutputResolver` builds for a CHAR/VARCHAR column written into a
+  // plain string column declares the CHAR/VARCHAR raw type key as non-inheritable, so that the raw
+  // type cannot resurface on the query output if some rule removes the no-op cast underneath it -
+  // which would make the DSv2 write command unresolved.
+  //
+  // A source column whose only metadata is the raw type ends up with an alias whose own metadata is
+  // empty once the key is filtered out, which used to satisfy the condition above and let this rule
+  // delete the alias, exposing the raw CHAR/VARCHAR attribute again. Such an alias must be kept.
+  //
+  // The test does not rely on the `SimplifyCasts` guard for IBM-101664: it strips the no-op cast
+  // with an unguarded copy of that rewrite first, which is the state a rule outside this repository
+  // (e.g. one injected through `SparkSessionExtensions`) could also produce.
+  test("IBM-101664: keep aliases that declare non-inheritable metadata keys") {
+    object UnguardedNoopCastElimination extends Rule[LogicalPlan] {
+      override def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressions {
+        case Cast(e, dataType, _, _) if e.dataType == dataType => e
+      }
+    }
+
+    val rawTypeKey = CharVarcharUtils.CHAR_VARCHAR_TYPE_STRING_METADATA_KEY
+
+    for (
+      rawType <- Seq(CharType(3), VarcharType(64));
+      policy <- Seq(StoreAssignmentPolicy.ANSI, StoreAssignmentPolicy.STRICT)
+    ) {
+      withSQLConf(SQLConf.STORE_ASSIGNMENT_POLICY.key -> policy.toString) {
+        // A Hive/Parquet-shaped source column: the raw type is the only metadata it carries.
+        val queryMetadata =
+          new MetadataBuilder().putString(rawTypeKey, rawType.catalogString).build()
+        val query = TestRelation(Seq(
+          AttributeReference("c", StringType, nullable = true, queryMetadata)()))
+        // A target column without metadata, e.g. an Iceberg table column.
+        val target = TestRelation(Seq(AttributeReference("c", StringType)()))
+
+        val analyzed = getAnalyzer.executeAndCheck(
+          AppendData.byName(target, query), new QueryPlanningTracker)
+        assert(analyzed.resolved)
+
+        val stripped = UnguardedNoopCastElimination(analyzed)
+        assert(!stripped.fastEquals(analyzed), s"the no-op cast was not removed:\n$analyzed")
+
+        val optimized = Optimize.execute(stripped)
+        assert(optimized.resolved, s"the write plan became unresolved:\n$optimized")
+        val rawTypes = optimized.asInstanceOf[V2WriteCommand].query.output
+          .flatMap(a => CharVarcharUtils.getRawTypeString(a.metadata))
+        assert(rawTypes.isEmpty,
+          s"CHAR/VARCHAR metadata leaked onto the query output:\n$optimized")
+        // the alias must survive, it is what hides the raw type
+        assert(optimized.exists {
+          case Project(projectList, _) => projectList.exists {
+            case a: Alias => a.nonInheritableMetadataKeys.contains(rawTypeKey)
+            case _ => false
+          }
+          case _ => false
+        }, s"the alignment alias was removed:\n$optimized")
+      }
     }
   }
 }

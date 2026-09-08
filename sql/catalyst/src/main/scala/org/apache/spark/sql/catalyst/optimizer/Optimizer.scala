@@ -630,8 +630,14 @@ object RemoveRedundantAliases extends Rule[LogicalPlan] {
     // Alias with metadata can not be stripped, or the metadata will be lost.
     // If the alias name is different from attribute name, we can't strip it either, or we
     // may accidentally change the output schema name of the root plan.
+    // IBM-specific fix, internal issue #101664: an alias that declares non-inheritable metadata
+    // keys can not be stripped either. Such an alias deliberately hides some of its child's
+    // metadata, so its own metadata may legitimately be empty while the child's is not, and
+    // replacing it with the child would resurface the hidden keys. `Project.doCanonicalize`
+    // applies the same condition.
     case a @ Alias(attr: Attribute, name)
       if (a.metadata == Metadata.empty || a.metadata == attr.metadata) &&
+        a.nonInheritableMetadataKeys.isEmpty &&
         name == attr.name &&
         !excludeList.contains(attr) &&
         !excludeList.contains(a) =>
