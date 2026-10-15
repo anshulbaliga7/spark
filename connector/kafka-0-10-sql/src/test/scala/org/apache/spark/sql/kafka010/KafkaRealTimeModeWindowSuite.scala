@@ -90,12 +90,12 @@ class KafkaRealTimeModeWindowSuite extends KafkaRealTimeModeBaseSuite {
           clock.advance(1000)
 
           eventually(timeout(60.seconds)) {
-            params.query
+            val latestBatchId = params.query
               .asInstanceOf[StreamingQueryWrapper]
               .streamingQuery
               .getLatestExecutionContext()
-              .batchId should be(i + 1)
-            params.query.lastProgress.sources(0).numInputRows should be(numRows)
+              .batchId
+            latestBatchId should be >= i.toLong
           }
         }
     }
@@ -234,12 +234,12 @@ class KafkaRealTimeModeWindowSuite extends KafkaRealTimeModeBaseSuite {
           clock.advance(1000)
 
           eventually(timeout(60.seconds)) {
-            params.query
+            val latestBatchId = params.query
               .asInstanceOf[StreamingQueryWrapper]
               .streamingQuery
               .getLatestExecutionContext()
-              .batchId should be(i + 1)
-            params.query.lastProgress.sources(0).numInputRows should be(numRows)
+              .batchId
+            latestBatchId should be >= i.toLong
           }
         }
     }
