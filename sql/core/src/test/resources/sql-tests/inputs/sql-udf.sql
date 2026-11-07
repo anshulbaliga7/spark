@@ -814,6 +814,19 @@ CREATE TEMPORARY FUNCTION foo3_5c(x INT) RETURNS TABLE (a INT) RETURN SELECT a F
 -- Expect error: permanent function cannot reference temporary function
 CREATE FUNCTION foo3_5d(x INT) RETURNS INT RETURN foo3_5a(x);
 CREATE FUNCTION foo3_5d(x INT) RETURNS TABLE (a INT) RETURN SELECT foo3_5a(x);
+-- Expect error: the same holds for a temporary table function and for a temporary function named
+-- through an IDENTIFIER clause. The rejected functions are the ones the analyzed body binds to,
+-- not the names that appear as plain calls in the body text.
+CREATE FUNCTION foo3_5d(x INT) RETURNS TABLE (a INT) RETURN SELECT * FROM foo3_5c(1);
+CREATE FUNCTION foo3_5d(x INT) RETURNS INT RETURN IDENTIFIER('foo3_5a')(x);
+-- A temporary function that only shares its name with a built-in function does not block a body
+-- that calls the built-in: the built-in owns the call.
+CREATE TEMPORARY FUNCTION abs(x INT) RETURNS INT RETURN 42;
+SELECT abs(-1);
+CREATE FUNCTION foo3_5h(x INT) RETURNS INT RETURN abs(x);
+SELECT foo3_5h(-1);
+DROP FUNCTION foo3_5h;
+DROP TEMPORARY FUNCTION abs;
 -- Expect error: permanent function cannot reference temporary view
 CREATE FUNCTION foo3_5d(x INT) RETURNS INT RETURN (SELECT SUM(a) FROM t);
 CREATE FUNCTION foo3_5d(x INT) RETURNS TABLE (a INT) RETURN SELECT a FROM t;

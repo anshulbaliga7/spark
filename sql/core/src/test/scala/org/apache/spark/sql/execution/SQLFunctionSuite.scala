@@ -114,6 +114,27 @@ class SQLFunctionSuite extends SharedSparkSession {
     }
   }
 
+  test("SPARK-60806: a temporary function stores the temporary functions its body resolves to") {
+    withUserDefinedFunction("tf_callee" -> true, "tf_caller" -> true) {
+      sql("CREATE TEMPORARY FUNCTION tf_callee(x INT) RETURNS INT RETURN x + 1")
+      // The callee is named through an IDENTIFIER clause, so it is not a plain call by name in the
+      // body text: the recorded name is the one the analysis binds the call to.
+      sql("CREATE TEMPORARY FUNCTION tf_caller(x INT) RETURNS INT " +
+        "RETURN IDENTIFIER('tf_callee')(x)")
+      val caller = spark.sessionState.functionRegistry
+        .lookupFunctionBuilder(FunctionIdentifier(
+          "tf_caller",
+          Some(CatalogManager.SESSION_NAMESPACE),
+          Some(CatalogManager.SYSTEM_CATALOG_NAME))).get
+        .apply(Seq(Literal(0))) match {
+          case f: SQLFunctionExpression => f.function
+          case other => fail(s"unexpected builder result: $other")
+        }
+      assert(caller.properties("referredTempFunctionsNames") === """["tf_callee"]""")
+      checkAnswer(sql("SELECT tf_caller(1)"), Row(2))
+    }
+  }
+
   test("SQL scalar function") {
     withUserDefinedFunction("area" -> false) {
       sql(

@@ -166,7 +166,9 @@ case class AnalysisContext(
     // 1. If we are resolving a view, this field will be restored from the view metadata,
     //    by calling `AnalysisContext.withAnalysisContext(viewDesc)`.
     // 2. If we are not resolving a view, this field will be updated everytime the analyzer
-    //    lookup a temporary function. And export to the view metadata.
+    //    lookup a temporary function. And export to the view metadata. SQL function creation
+    //    reads it the same way (SPARK-60806): a persistent function rejects the names and a
+    //    temporary function stores them in its metadata.
     referredTempFunctionNames: mutable.Set[String] = mutable.Set.empty,
     referredTempVariableNames: Seq[Seq[String]] = Seq.empty,
     // Like `referredTempFunctionNames`, this is populated only by fixed-point analysis (by
@@ -346,6 +348,18 @@ object AnalysisContext {
     try f finally { set(originContext) }
   }
 }
+
+/**
+ * The temporary objects that an analysis recorded in its [[AnalysisContext]] and that cannot be
+ * read off the unresolved or the analyzed plan. See [[Analyzer.executeWithReferredTempObjects]].
+ *
+ * @param functionNames the temporary functions the plan resolved to, sorted.
+ * @param variableNamesUnderIdentifier the temporary variables read inside IDENTIFIER clauses, in
+ *                                     the order they were recorded.
+ */
+case class ReferredTempObjects(
+    functionNames: Seq[String],
+    variableNamesUnderIdentifier: Seq[Seq[String]])
 
 object Analyzer {
   // Configs with bindingPolicy SESSION or NOT_APPLICABLE are retained when resolving views and
@@ -602,25 +616,33 @@ class Analyzer(
   }
 
   /**
-   * Like [[execute]], but also returns the temporary variables recorded via IDENTIFIER clauses
-   * during this analysis (`AnalysisContext.referredTempVariableNamesUnderIdentifier`).
+   * Like [[execute]], but also returns the temporary objects recorded in the analysis context
+   * during this analysis, which [[execute]] discards with that context: the temporary functions
+   * the plan resolved to (`AnalysisContext.referredTempFunctionNames`, in sorted order so that an
+   * error naming one of them is deterministic) and the temporary variables read through IDENTIFIER
+   * clauses (`AnalysisContext.referredTempVariableNamesUnderIdentifier`).
    *
    * SQL function creation analyzes the body, inspects it, and only then runs `checkAnalysis`, so
    * it cannot go through [[executeAndCheckReferredTempVariablesUnderIdentifier]]. It still needs
-   * the recorded variables, which [[execute]] discards with its analysis context: a persistent
-   * function must reject them and a temporary one stores them in its metadata.
+   * both: a persistent function must reject them and a temporary one stores them in its metadata.
+   * Neither can be read off the plans. Only resolution tells which function a call binds to: a
+   * temporary function that merely shares its name with a built-in does not own a call to the
+   * built-in, and a temporary table function or a function named through an IDENTIFIER clause is
+   * not a plain scalar call by name. The analyzed plan, in turn, no longer mentions the variables.
    *
    * Only the variables read by the body itself are returned. A SQL function that the body calls
    * is expanded in a context of its own, so a variable it reads through an IDENTIFIER clause stays
    * that function's dependency rather than becoming one of the function under creation.
    */
-  def executeWithReferredTempVariablesUnderIdentifier(
-      plan: LogicalPlan): (LogicalPlan, Seq[Seq[String]]) = {
+  def executeWithReferredTempObjects(plan: LogicalPlan): (LogicalPlan, ReferredTempObjects) = {
     AnalysisContext.withNewAnalysisContext {
       AnalysisContext.withSharingIdentifierVariablesWithNestedSQLFunctions(share = false) {
         val analyzed = executeSameContext(plan)
-        // Read the accumulator before the context is restored on exit.
-        (analyzed, AnalysisContext.get.referredTempVariableNamesUnderIdentifier.toSeq)
+        // Read the accumulators before the context is restored on exit.
+        val context = AnalysisContext.get
+        (analyzed, ReferredTempObjects(
+          functionNames = context.referredTempFunctionNames.toSeq.sorted,
+          variableNamesUnderIdentifier = context.referredTempVariableNamesUnderIdentifier.toSeq))
       }
     }
   }
